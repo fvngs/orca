@@ -35,7 +35,7 @@ pub struct ImageInfo {
     pub created: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum BackendKind {
     Docker,
     Podman,

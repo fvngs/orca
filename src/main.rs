@@ -14,6 +14,7 @@ use std::io;
 
 use app::App;
 use docker::DockerBackend;
+use events::{EventOutcome, exec_shell_blocking};
 
 #[derive(Parser)]
 #[command(name = "orca", about = "A TUI for Docker and Podman")]
@@ -58,8 +59,21 @@ async fn run(
     loop {
         terminal.draw(|f| ui::draw(f, &mut app))?;
 
-        if events::handle_events(&mut app).await? {
-            break;
+        match events::handle_events(&mut app).await? {
+            EventOutcome::Quit => break,
+            EventOutcome::ExecShell { container_id } => {
+                // Suspend TUI, hand terminal to exec, then resume
+                disable_raw_mode()?;
+                execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+
+                let kind = app.backend.kind.clone();
+                let _ = exec_shell_blocking(&container_id, &kind);
+
+                enable_raw_mode()?;
+                execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+                terminal.clear()?;
+            }
+            EventOutcome::Continue => {}
         }
     }
 

@@ -293,10 +293,10 @@ fn draw_contexts(f: &mut Frame, area: Rect, app: &mut App) {
 
 fn draw_status_bar(f: &mut Frame, area: Rect, app: &App) {
     let hints = match app.view {
-        View::Containers => "j/k:navigate  enter/l:logs  s:start/stop  r:restart  d:remove  tab:switch  q:quit",
+        View::Containers => "j/k:navigate  enter/l:logs  e:exec  s:start/stop  r:restart  d:remove  tab:switch  q:quit",
         View::Logs => "j/k:scroll  f:follow  g:top  G:bottom  esc:back  q:quit",
         View::Images => "j/k:navigate  tab:switch  q:quit",
-        View::Contexts => "j/k:navigate  enter:select  tab:switch  q:quit",
+        View::Contexts => "j/k:navigate  enter:switch context  tab:switch  q:quit",
     };
 
     let status = if let Some(msg) = &app.status_message {

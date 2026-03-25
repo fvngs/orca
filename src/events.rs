@@ -3,19 +3,24 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use std::time::Duration;
 
 use crate::app::{Action, App, ConfirmAction, View};
+use crate::docker::BackendKind;
 
-/// Returns true if the application should quit.
-pub async fn handle_events(app: &mut App) -> Result<bool> {
-    // Always drain background messages first
+pub enum EventOutcome {
+    Continue,
+    Quit,
+    ExecShell { container_id: String },
+}
+
+pub async fn handle_events(app: &mut App) -> Result<EventOutcome> {
     app.process_messages();
 
     if !event::poll(Duration::from_millis(50))? {
-        return Ok(false);
+        return Ok(EventOutcome::Continue);
     }
 
     if let Event::Key(key) = event::read()? {
         if key.kind != KeyEventKind::Press {
-            return Ok(false);
+            return Ok(EventOutcome::Continue);
         }
 
         // Confirmation dialog takes priority
@@ -30,26 +35,30 @@ pub async fn handle_events(app: &mut App) -> Result<bool> {
                     app.status_message = Some("cancelled".to_string());
                 }
             }
-            return Ok(false);
+            return Ok(EventOutcome::Continue);
         }
 
         // Global keybinds
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return Ok(true);
+            return Ok(EventOutcome::Quit);
         }
 
         match key.code {
-            KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('q') => return Ok(EventOutcome::Quit),
             KeyCode::Tab => cycle_view(app),
             KeyCode::Char('1') => app.view = View::Containers,
             KeyCode::Char('2') => app.view = View::Logs,
             KeyCode::Char('3') => app.view = View::Images,
             KeyCode::Char('4') => app.view = View::Contexts,
-            _ => handle_view_keys(app, key.code).await,
+            _ => {
+                if let Some(outcome) = handle_view_keys(app, key.code).await {
+                    return Ok(outcome);
+                }
+            }
         }
     }
 
-    Ok(false)
+    Ok(EventOutcome::Continue)
 }
 
 fn cycle_view(app: &mut App) {
@@ -61,20 +70,41 @@ fn cycle_view(app: &mut App) {
     };
 }
 
-async fn handle_view_keys(app: &mut App, code: KeyCode) {
+/// Returns Some(outcome) only when special handling is needed (e.g. ExecShell).
+async fn handle_view_keys(app: &mut App, code: KeyCode) -> Option<EventOutcome> {
     match app.view {
         View::Containers => handle_containers(app, code).await,
-        View::Logs => handle_logs(app, code),
-        View::Images => handle_images(app, code),
-        View::Contexts => handle_contexts(app, code).await,
+        View::Logs => {
+            handle_logs(app, code);
+            None
+        }
+        View::Images => {
+            handle_images(app, code);
+            None
+        }
+        View::Contexts => {
+            handle_contexts(app, code);
+            None
+        }
     }
 }
 
-async fn handle_containers(app: &mut App, code: KeyCode) {
+async fn handle_containers(app: &mut App, code: KeyCode) -> Option<EventOutcome> {
     match code {
         KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
         KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
         KeyCode::Enter | KeyCode::Char('l') => app.open_logs(),
+        KeyCode::Char('e') => {
+            if let Some(c) = app.selected_container() {
+                if c.state == "running" {
+                    return Some(EventOutcome::ExecShell {
+                        container_id: c.id.clone(),
+                    });
+                } else {
+                    app.status_message = Some("container is not running".to_string());
+                }
+            }
+        }
         KeyCode::Char('s') => {
             if let Some(c) = app.selected_container() {
                 let id = c.id.clone();
@@ -116,6 +146,7 @@ async fn handle_containers(app: &mut App, code: KeyCode) {
         }
         _ => {}
     }
+    None
 }
 
 fn handle_logs(app: &mut App, code: KeyCode) {
@@ -149,10 +180,22 @@ fn handle_images(app: &mut App, code: KeyCode) {
     }
 }
 
-async fn handle_contexts(app: &mut App, code: KeyCode) {
+fn handle_contexts(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
         KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
+        KeyCode::Enter => {
+            if let Some(name) = app.contexts.get(app.context_selected).cloned() {
+                let result = std::process::Command::new("docker")
+                    .args(["context", "use", &name])
+                    .status();
+                app.status_message = Some(match result {
+                    Ok(s) if s.success() => format!("switched to context '{name}'"),
+                    Ok(_) => format!("docker context use {name} failed"),
+                    Err(e) => format!("error: {e}"),
+                });
+            }
+        }
         _ => {}
     }
 }
@@ -168,4 +211,15 @@ async fn execute_confirmed(app: &mut App, action: ConfirmAction) {
             });
         }
     }
+}
+
+/// Spawn an interactive shell inside a container, suspending the TUI while it runs.
+/// Caller is responsible for restoring terminal state before/after this call.
+pub fn exec_shell_blocking(container_id: &str, kind: &BackendKind) -> Result<()> {
+    let (cmd, args): (&str, Vec<&str>) = match kind {
+        BackendKind::Docker => ("docker", vec!["exec", "-it", container_id, "sh"]),
+        BackendKind::Podman => ("podman", vec!["exec", "-it", container_id, "sh"]),
+    };
+    std::process::Command::new(cmd).args(&args).status()?;
+    Ok(())
 }
