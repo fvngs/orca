@@ -1,0 +1,24 @@
+[package]
+name = "orca"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "orca"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+bollard = "0.18"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+bytes = "1"
+strip-ansi-escapes = "0.2"
+unicode-width = "0.2"
+libc = "0.2"
