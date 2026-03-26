@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::docker::{ContainerInfo, DockerBackend, ImageInfo};
+use crate::docker::{ContainerInfo, DockerBackend, ImageInfo, VolumeInfo};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum View {
@@ -11,6 +11,7 @@ pub enum View {
     Logs,
     Images,
     Contexts,
+    Volumes,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -23,6 +24,7 @@ pub enum Action {
 pub enum ConfirmAction {
     Remove(String),
     RemoveMultiple(Vec<String>),
+    RemoveImage(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -82,10 +84,17 @@ pub enum AppMessage {
     ContainersRefreshed(Vec<ContainerInfo>),
     ImagesRefreshed(Vec<ImageInfo>),
     ContextsRefreshed(Vec<String>),
+    VolumesRefreshed(Vec<VolumeInfo>),
     StatsUpdated { id: String, cpu: f64, mem: u64, mem_limit: u64 },
     LogLine(String),
+    Status(String),
     Error(String),
     InspectData(Vec<String>),
+}
+
+pub enum GroupedRow {
+    Header(String),
+    Item(String), // container id
 }
 
 pub struct App {
@@ -118,9 +127,17 @@ pub struct App {
     pub log_search_active: bool,
     pub log_search_matches: Vec<usize>,
     pub log_search_idx: usize,
+    pub log_view_height: usize,
 
     pub contexts: Vec<String>,
     pub context_selected: usize,
+
+    pub volumes: Vec<VolumeInfo>,
+    pub volume_selected: usize,
+    pub volume_filter_input: Option<String>,
+    pub volume_filter_active: bool,
+
+    pub compose_group_mode: bool,
 
     pub status_message: Option<String>,
     pub pending_action: Action,
@@ -143,6 +160,7 @@ pub struct App {
     rx: mpsc::Receiver<AppMessage>,
 
     tasks: Vec<JoinHandle<()>>,
+    log_task: Option<JoinHandle<()>>,
 }
 
 impl App {
@@ -169,8 +187,14 @@ impl App {
             log_search_active: false,
             log_search_matches: vec![],
             log_search_idx: 0,
+            log_view_height: 20,
             contexts: vec![],
             context_selected: 0,
+            volumes: vec![],
+            volume_selected: 0,
+            volume_filter_input: None,
+            volume_filter_active: false,
+            compose_group_mode: false,
             status_message: None,
             pending_action: Action::None,
             inspect_view: false,
@@ -184,6 +208,7 @@ impl App {
             tx,
             rx,
             tasks: vec![],
+            log_task: None,
         }
     }
 
@@ -201,7 +226,11 @@ impl App {
 
         // Periodically refresh containers + images
         let handle = tokio::spawn(async move {
+            let mut stats_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
             loop {
+                for h in stats_handles.drain(..) {
+                    h.abort();
+                }
                 match backend.list_containers().await {
                     Ok(containers) => {
                         let _ = tx.send(AppMessage::ContainersRefreshed(containers.clone())).await;
@@ -209,11 +238,12 @@ impl App {
                             let b = Arc::clone(&backend);
                             let id = c.id.clone();
                             let t = tx.clone();
-                            tokio::spawn(async move {
+                            let h = tokio::spawn(async move {
                                 if let Ok((cpu, mem, mem_limit)) = b.fetch_stats(&id).await {
                                     let _ = t.send(AppMessage::StatsUpdated { id, cpu, mem, mem_limit }).await;
                                 }
                             });
+                            stats_handles.push(h);
                         }
                     }
                     Err(e) => {
@@ -224,6 +254,15 @@ impl App {
                 match backend.list_images().await {
                     Ok(images) => {
                         let _ = tx.send(AppMessage::ImagesRefreshed(images)).await;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppMessage::Error(e.to_string())).await;
+                    }
+                }
+
+                match backend.list_volumes().await {
+                    Ok(volumes) => {
+                        let _ = tx.send(AppMessage::VolumesRefreshed(volumes)).await;
                     }
                     Err(e) => {
                         let _ = tx.send(AppMessage::Error(e.to_string())).await;
@@ -263,6 +302,11 @@ impl App {
                     self.contexts = list;
                     self.context_selected =
                         self.context_selected.min(self.contexts.len().saturating_sub(1));
+                }
+                AppMessage::VolumesRefreshed(list) => {
+                    self.volumes = list;
+                    self.volume_selected =
+                        self.volume_selected.min(self.volumes.len().saturating_sub(1));
                 }
                 AppMessage::StatsUpdated { id, cpu, mem, mem_limit } => {
                     if let Some(c) = self.containers.iter_mut().find(|c| c.id == id) {
@@ -304,6 +348,9 @@ impl App {
                         }
                     }
                 }
+                AppMessage::Status(msg) => {
+                    self.status_message = Some(msg);
+                }
                 AppMessage::Error(e) => {
                     self.status_message = Some(format!("error: {e}"));
                 }
@@ -343,6 +390,58 @@ impl App {
         list
     }
 
+    /// Returns filtered volumes
+    pub fn filtered_volumes(&self) -> Vec<&VolumeInfo> {
+        if let Some(filter) = &self.volume_filter_input {
+            if !filter.is_empty() {
+                let lower = filter.to_lowercase();
+                return self.volumes.iter().filter(|v| v.name.to_lowercase().contains(&lower)).collect();
+            }
+        }
+        self.volumes.iter().collect()
+    }
+
+    /// Returns grouped container rows for compose grouping display
+    pub fn grouped_container_rows(&self) -> Vec<GroupedRow> {
+        let containers = self.filtered_containers();
+        let has_grouped = containers.iter().any(|c| c.compose_project.is_some());
+
+        if !has_grouped {
+            return containers.iter().map(|c| GroupedRow::Item(c.id.clone())).collect();
+        }
+
+        // Sort: grouped first (Some < None), then by project name, then by container name
+        let mut sorted: Vec<&ContainerInfo> = containers;
+        sorted.sort_by(|a, b| {
+            match (&a.compose_project, &b.compose_project) {
+                (Some(pa), Some(pb)) => pa.cmp(pb).then(a.name.cmp(&b.name)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.name.cmp(&b.name),
+            }
+        });
+
+        let mut rows = Vec::new();
+        let mut prev_project: Option<String> = None;
+
+        for c in &sorted {
+            let project_key = c.compose_project.clone();
+            let project_name = project_key.clone().unwrap_or_else(|| "(standalone)".to_string());
+            let changed = match (&prev_project, &project_key) {
+                (None, None) => false,
+                (Some(p), Some(q)) => p != q,
+                _ => true,
+            };
+            if changed {
+                rows.push(GroupedRow::Header(project_name));
+                prev_project = project_key;
+            }
+            rows.push(GroupedRow::Item(c.id.clone()));
+        }
+
+        rows
+    }
+
     /// Returns filtered images
     pub fn filtered_images(&self) -> Vec<&ImageInfo> {
         if let Some(filter) = &self.filter_input {
@@ -354,6 +453,14 @@ impl App {
             }
         }
         self.images.iter().collect()
+    }
+
+    pub fn log_filtered_count(&self) -> usize {
+        match self.log_filter {
+            LogFilter::NoFilter => self.log_lines.len(),
+            LogFilter::HideDebug => self.log_lines.iter().filter(|l| !l.to_lowercase().contains("debug")).count(),
+            LogFilter::ErrorOnly => self.log_lines.iter().filter(|l| { let l = l.to_lowercase(); l.contains("error") || l.contains("warn") }).count(),
+        }
     }
 
     pub fn scroll_up(&mut self) {
@@ -378,7 +485,8 @@ impl App {
             }
             View::Logs => {
                 self.log_follow = false;
-                self.log_scroll = self.log_scroll.saturating_sub(1);
+                let max_start = self.log_filtered_count().saturating_sub(self.log_view_height.max(1));
+                self.log_scroll = self.log_scroll.min(max_start).saturating_sub(1);
             }
             View::Images => {
                 let list = self.filtered_images();
@@ -395,6 +503,9 @@ impl App {
             }
             View::Contexts => {
                 self.context_selected = self.context_selected.saturating_sub(1);
+            }
+            View::Volumes => {
+                self.volume_selected = self.volume_selected.saturating_sub(1);
             }
         }
     }
@@ -422,10 +533,11 @@ impl App {
                 }
             }
             View::Logs => {
-                let max = self.log_lines.len().saturating_sub(1);
-                if self.log_scroll < max {
+                let max_start = self.log_filtered_count().saturating_sub(self.log_view_height.max(1));
+                if self.log_scroll < max_start {
                     self.log_scroll += 1;
                 } else {
+                    self.log_scroll = max_start;
                     self.log_follow = true;
                 }
             }
@@ -447,6 +559,12 @@ impl App {
                     self.context_selected += 1;
                 }
             }
+            View::Volumes => {
+                let len = self.filtered_volumes().len();
+                if self.volume_selected + 1 < len {
+                    self.volume_selected += 1;
+                }
+            }
         }
     }
 
@@ -462,6 +580,9 @@ impl App {
             self.log_search_matches.clear();
             self.log_search_idx = 0;
 
+            if let Some(prev) = self.log_task.take() {
+                prev.abort();
+            }
             let backend = Arc::clone(&self.backend);
             let tx = self.tx.clone();
             let handle = tokio::spawn(async move {
@@ -475,7 +596,7 @@ impl App {
                 });
                 let _ = backend.stream_logs(&id, log_tx).await;
             });
-            self.tasks.push(handle);
+            self.log_task = Some(handle);
         }
     }
 
@@ -495,6 +616,9 @@ impl App {
     }
 
     pub async fn shutdown(&mut self) {
+        if let Some(h) = self.log_task.take() {
+            h.abort();
+        }
         for handle in self.tasks.drain(..) {
             handle.abort();
         }

@@ -80,6 +80,32 @@ pub async fn handle_events(app: &mut App) -> Result<EventOutcome> {
             return Ok(EventOutcome::Continue);
         }
 
+        // Volume filter input mode
+        if app.volume_filter_active {
+            match key.code {
+                KeyCode::Esc => {
+                    app.volume_filter_active = false;
+                    app.volume_filter_input = None;
+                }
+                KeyCode::Enter => {
+                    app.volume_filter_active = false;
+                }
+                KeyCode::Backspace => {
+                    if let Some(ref mut s) = app.volume_filter_input {
+                        s.pop();
+                        if s.is_empty() {
+                            app.volume_filter_input = None;
+                        }
+                    }
+                }
+                KeyCode::Char(c) => {
+                    app.volume_filter_input.get_or_insert_with(String::new).push(c);
+                }
+                _ => {}
+            }
+            return Ok(EventOutcome::Continue);
+        }
+
         // Log search input mode
         if app.log_search_active {
             match key.code {
@@ -137,6 +163,7 @@ pub async fn handle_events(app: &mut App) -> Result<EventOutcome> {
             KeyCode::Char('2') => app.view = View::Logs,
             KeyCode::Char('3') => app.view = View::Images,
             KeyCode::Char('4') => app.view = View::Contexts,
+            KeyCode::Char('5') => app.view = View::Volumes,
             _ => {
                 if let Some(outcome) = handle_view_keys(app, key.code).await {
                     return Ok(outcome);
@@ -152,7 +179,8 @@ fn cycle_view(app: &mut App) {
     app.view = match app.view {
         View::Containers => View::Images,
         View::Images => View::Contexts,
-        View::Contexts => View::Containers,
+        View::Contexts => View::Volumes,
+        View::Volumes => View::Containers,
         View::Logs => View::Containers,
     };
 }
@@ -171,6 +199,10 @@ async fn handle_view_keys(app: &mut App, code: KeyCode) -> Option<EventOutcome> 
         }
         View::Contexts => {
             handle_contexts(app, code);
+            None
+        }
+        View::Volumes => {
+            handle_volumes(app, code);
             None
         }
     }
@@ -336,21 +368,17 @@ async fn handle_containers(app: &mut App, code: KeyCode) -> Option<EventOutcome>
                 let tx = app.tx.clone();
                 if state == "running" {
                     tokio::spawn(async move {
-                        let result = b.stop(&id).await;
-                        let msg = match result {
-                            Ok(_) => format!("stopped {id}"),
-                            Err(e) => format!("error: {e}"),
-                        };
-                        let _ = tx.send(AppMessage::Error(msg)).await;
+                        match b.stop(&id).await {
+                            Ok(_) => { let _ = tx.send(AppMessage::Status(format!("stopped {id}"))).await; }
+                            Err(e) => { let _ = tx.send(AppMessage::Error(e.to_string())).await; }
+                        }
                     });
                 } else {
                     tokio::spawn(async move {
-                        let result = b.start(&id).await;
-                        let msg = match result {
-                            Ok(_) => format!("started {id}"),
-                            Err(e) => format!("error: {e}"),
-                        };
-                        let _ = tx.send(AppMessage::Error(msg)).await;
+                        match b.start(&id).await {
+                            Ok(_) => { let _ = tx.send(AppMessage::Status(format!("started {id}"))).await; }
+                            Err(e) => { let _ = tx.send(AppMessage::Error(e.to_string())).await; }
+                        }
                     });
                 }
             }
@@ -373,12 +401,10 @@ async fn handle_containers(app: &mut App, code: KeyCode) -> Option<EventOutcome>
                 let b = std::sync::Arc::clone(&backend);
                 let tx = app.tx.clone();
                 tokio::spawn(async move {
-                    let result = b.restart(&id).await;
-                    let msg = match result {
-                        Ok(_) => format!("restarted {id}"),
-                        Err(e) => format!("error: {e}"),
-                    };
-                    let _ = tx.send(AppMessage::Error(msg)).await;
+                    match b.restart(&id).await {
+                        Ok(_) => { let _ = tx.send(AppMessage::Status(format!("restarted {id}"))).await; }
+                        Err(e) => { let _ = tx.send(AppMessage::Error(e.to_string())).await; }
+                    }
                 });
             }
             if !ids.is_empty() {
@@ -401,6 +427,10 @@ async fn handle_containers(app: &mut App, code: KeyCode) -> Option<EventOutcome>
                 };
             }
         }
+        KeyCode::Char('C') => {
+            app.compose_group_mode = !app.compose_group_mode;
+            app.last_key = None;
+        }
         KeyCode::Char('P') => {
             app.last_key = None;
             if let Some(c) = app.selected_container() {
@@ -411,15 +441,15 @@ async fn handle_containers(app: &mut App, code: KeyCode) -> Option<EventOutcome>
                 if state == "paused" {
                     tokio::spawn(async move {
                         match backend.unpause(&id).await {
-                            Ok(_) => { let _ = tx.send(AppMessage::Error(format!("unpaused {id}"))).await; }
-                            Err(e) => { let _ = tx.send(AppMessage::Error(format!("error: {e}"))).await; }
+                            Ok(_) => { let _ = tx.send(AppMessage::Status(format!("unpaused {id}"))).await; }
+                            Err(e) => { let _ = tx.send(AppMessage::Error(e.to_string())).await; }
                         }
                     });
                 } else if state == "running" {
                     tokio::spawn(async move {
                         match backend.pause(&id).await {
-                            Ok(_) => { let _ = tx.send(AppMessage::Error(format!("paused {id}"))).await; }
-                            Err(e) => { let _ = tx.send(AppMessage::Error(format!("error: {e}"))).await; }
+                            Ok(_) => { let _ = tx.send(AppMessage::Status(format!("paused {id}"))).await; }
+                            Err(e) => { let _ = tx.send(AppMessage::Error(e.to_string())).await; }
                         }
                     });
                 } else {
@@ -533,6 +563,22 @@ fn handle_images(app: &mut App, code: KeyCode) {
                 app.status_message = Some(format!("copied: {short_id}"));
             }
         }
+        KeyCode::Char('d') => {
+            if let Some(img) = app.images.get(app.image_selected) {
+                let tag_or_id = img.repo_tags.first().cloned().unwrap_or_else(|| {
+                    if img.id.starts_with("sha256:") {
+                        img.id[7..].chars().take(12).collect::<String>()
+                    } else {
+                        img.id.chars().take(12).collect::<String>()
+                    }
+                });
+                let message = format!("Remove image '{tag_or_id}'? (y/n)");
+                app.pending_action = Action::Confirm {
+                    message,
+                    action: ConfirmAction::RemoveImage(img.id.clone()),
+                };
+            }
+        }
         _ => {}
     }
     app.last_key = None;
@@ -544,15 +590,41 @@ fn handle_contexts(app: &mut App, code: KeyCode) {
         KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
         KeyCode::Enter => {
             if let Some(name) = app.contexts.get(app.context_selected).cloned() {
-                let result = std::process::Command::new("docker")
-                    .args(["context", "use", &name])
-                    .status();
-                app.status_message = Some(match result {
-                    Ok(s) if s.success() => format!("switched to context '{name}'"),
-                    Ok(_) => format!("docker context use {name} failed"),
-                    Err(e) => format!("error: {e}"),
+                let tx = app.tx.clone();
+                tokio::spawn(async move {
+                    let result = tokio::process::Command::new("docker")
+                        .args(["context", "use", &name])
+                        .status()
+                        .await;
+                    match result {
+                        Ok(s) if s.success() => {
+                            let _ = tx.send(AppMessage::Status(format!("switched to context '{name}'"))).await;
+                        }
+                        Ok(_) => {
+                            let _ = tx.send(AppMessage::Error(format!("docker context use {name} failed"))).await;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppMessage::Error(e.to_string())).await;
+                        }
+                    }
                 });
             }
+        }
+        _ => {}
+    }
+}
+
+fn handle_volumes(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
+        KeyCode::Char('/') => {
+            app.volume_filter_active = true;
+            app.volume_filter_input = Some(String::new());
+        }
+        KeyCode::Esc => {
+            app.volume_filter_input = None;
+            app.volume_filter_active = false;
         }
         _ => {}
     }
@@ -582,6 +654,14 @@ async fn execute_confirmed(app: &mut App, action: ConfirmAction) {
             } else {
                 app.status_message = Some(format!("errors: {}", errors.join(", ")));
             }
+        }
+        ConfirmAction::RemoveImage(id) => {
+            let backend = std::sync::Arc::clone(&app.backend);
+            let result = backend.remove_image(&id).await;
+            app.status_message = Some(match result {
+                Ok(_) => format!("removed image {id}"),
+                Err(e) => format!("error: {e}"),
+            });
         }
     }
 }
