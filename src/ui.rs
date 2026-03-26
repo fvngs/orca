@@ -9,7 +9,7 @@ use ratatui::{
     },
 };
 
-use crate::app::{Action, App, LogFilter, View};
+use crate::app::{Action, App, GroupedRow, LogFilter, View};
 use crate::docker::{BackendKind, ContainerInfo};
 
 const HEADER_COLOR: Color = Color::Cyan;
@@ -53,6 +53,8 @@ fn draw_title_bar(f: &mut Frame, area: Rect, app: &App) {
         tab_span("3:Images", app.view == View::Images),
         Span::raw("  "),
         tab_span("4:Contexts", app.view == View::Contexts),
+        Span::raw("  "),
+        tab_span("5:Volumes", app.view == View::Volumes),
         Span::raw(format!("   [{backend_label}]")),
     ];
 
@@ -87,6 +89,7 @@ fn draw_main(f: &mut Frame, area: Rect, app: &mut App) {
         View::Logs => draw_logs(f, area, app),
         View::Images => draw_images(f, area, app),
         View::Contexts => draw_contexts(f, area, app),
+        View::Volumes => draw_volumes(f, area, app),
     }
 }
 
@@ -107,20 +110,15 @@ fn draw_containers(f: &mut Frame, area: Rect, app: &mut App) {
         (area, None)
     };
 
-    // Build sorted+filtered list
-    let containers: Vec<&ContainerInfo> = app.sorted_filtered_containers();
-
-    // Determine visual selection index in filtered list
-    let visual_selected = selected_id.as_ref().and_then(|id| {
-        containers.iter().position(|c| &c.id == id)
-    }).unwrap_or(0);
-
     let sort_label = app.container_sort.label();
     let wide = app.wide_mode;
     let multi_count = app.container_selected_ids.len();
+    let group_mode = app.compose_group_mode;
 
     let title = if multi_count > 0 {
         format!(" Containers [sort: {sort_label}] [{multi_count} selected] ")
+    } else if group_mode {
+        format!(" Containers [sort: {sort_label}] [grouped] ")
     } else {
         format!(" Containers [sort: {sort_label}] ")
     };
@@ -144,39 +142,122 @@ fn draw_containers(f: &mut Frame, area: Rect, app: &mut App) {
         ])
     };
 
-    let selected_ids = &app.container_selected_ids;
+    let selected_ids = app.container_selected_ids.clone();
 
-    let rows: Vec<Row> = containers.iter().map(|c| {
-        let state_color = match c.state.as_str() {
-            "running" => RUNNING_COLOR,
-            "paused" => PAUSED_COLOR,
-            _ => STOPPED_COLOR,
-        };
-        let is_multi_selected = selected_ids.contains(&c.id);
-        let prefix = if is_multi_selected { "● " } else { "  " };
-        let name_cell = if is_multi_selected {
-            Cell::from(format!("{prefix}{}", c.name))
-                .style(Style::default().fg(Color::Cyan))
-        } else {
-            Cell::from(format!("{prefix}{}", c.name))
-        };
-        let image_cell = Cell::from(truncate(&c.image, 28));
-        let status_cell = Cell::from(c.status.clone()).style(Style::default().fg(state_color));
-        let cpu_cell = Cell::from(format!("{:.1}%", c.cpu_percent));
-        let mem_cell = Cell::from(format_bytes(c.mem_usage));
+    let (rows, visual_selected) = if group_mode {
+        let grouped_rows = app.grouped_container_rows();
+        // Find visual_selected: position in grouped_rows where Item matches selected_id
+        let vis = selected_id.as_ref().and_then(|sid| {
+            grouped_rows.iter().position(|r| matches!(r, GroupedRow::Item(id) if id == sid))
+        }).unwrap_or(0);
 
-        if wide {
-            let ports_str = if c.ports.is_empty() {
-                "-".to_string()
-            } else {
-                c.ports.join(", ")
+        let rows: Vec<Row> = grouped_rows.iter().map(|row| {
+            match row {
+                GroupedRow::Header(name) => {
+                    let header_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+                    if wide {
+                        Row::new(vec![
+                            Cell::from(format!("▸ {name}")).style(header_style),
+                            Cell::from("").style(header_style),
+                            Cell::from("").style(header_style),
+                            Cell::from("").style(header_style),
+                            Cell::from("").style(header_style),
+                            Cell::from("").style(header_style),
+                        ]).style(header_style)
+                    } else {
+                        Row::new(vec![
+                            Cell::from(format!("▸ {name}")).style(header_style),
+                            Cell::from("").style(header_style),
+                            Cell::from("").style(header_style),
+                            Cell::from("").style(header_style),
+                            Cell::from("").style(header_style),
+                        ]).style(header_style)
+                    }
+                }
+                GroupedRow::Item(id) => {
+                    if let Some(c) = app.containers.iter().find(|c| &c.id == id) {
+                        let state_color = match c.state.as_str() {
+                            "running" => RUNNING_COLOR,
+                            "paused" => PAUSED_COLOR,
+                            _ => STOPPED_COLOR,
+                        };
+                        let is_multi_selected = selected_ids.contains(&c.id);
+                        let prefix = if is_multi_selected { "● " } else { "  " };
+                        let name_cell = if is_multi_selected {
+                            Cell::from(format!("{prefix}{}", c.name))
+                                .style(Style::default().fg(Color::Cyan))
+                        } else {
+                            Cell::from(format!("{prefix}{}", c.name))
+                        };
+                        let image_cell = Cell::from(truncate(&c.image, 28));
+                        let status_cell = Cell::from(c.status.clone()).style(Style::default().fg(state_color));
+                        let cpu_cell = Cell::from(format!("{:.1}%", c.cpu_percent));
+                        let mem_cell = Cell::from(format_bytes(c.mem_usage));
+
+                        if wide {
+                            let ports_str = if c.ports.is_empty() {
+                                "-".to_string()
+                            } else {
+                                c.ports.join(", ")
+                            };
+                            let ports_cell = Cell::from(truncate(&ports_str, 28));
+                            Row::new(vec![name_cell, image_cell, status_cell, cpu_cell, mem_cell, ports_cell])
+                        } else {
+                            Row::new(vec![name_cell, image_cell, status_cell, cpu_cell, mem_cell])
+                        }
+                    } else {
+                        if wide {
+                            Row::new(vec![Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from("")])
+                        } else {
+                            Row::new(vec![Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from("")])
+                        }
+                    }
+                }
+            }
+        }).collect();
+        (rows, vis)
+    } else {
+        // Build sorted+filtered list
+        let containers: Vec<&ContainerInfo> = app.sorted_filtered_containers();
+
+        // Determine visual selection index in filtered list
+        let vis = selected_id.as_ref().and_then(|id| {
+            containers.iter().position(|c| &c.id == id)
+        }).unwrap_or(0);
+
+        let rows: Vec<Row> = containers.iter().map(|c| {
+            let state_color = match c.state.as_str() {
+                "running" => RUNNING_COLOR,
+                "paused" => PAUSED_COLOR,
+                _ => STOPPED_COLOR,
             };
-            let ports_cell = Cell::from(truncate(&ports_str, 28));
-            Row::new(vec![name_cell, image_cell, status_cell, cpu_cell, mem_cell, ports_cell])
-        } else {
-            Row::new(vec![name_cell, image_cell, status_cell, cpu_cell, mem_cell])
-        }
-    }).collect();
+            let is_multi_selected = selected_ids.contains(&c.id);
+            let prefix = if is_multi_selected { "● " } else { "  " };
+            let name_cell = if is_multi_selected {
+                Cell::from(format!("{prefix}{}", c.name))
+                    .style(Style::default().fg(Color::Cyan))
+            } else {
+                Cell::from(format!("{prefix}{}", c.name))
+            };
+            let image_cell = Cell::from(truncate(&c.image, 28));
+            let status_cell = Cell::from(c.status.clone()).style(Style::default().fg(state_color));
+            let cpu_cell = Cell::from(format!("{:.1}%", c.cpu_percent));
+            let mem_cell = Cell::from(format_bytes(c.mem_usage));
+
+            if wide {
+                let ports_str = if c.ports.is_empty() {
+                    "-".to_string()
+                } else {
+                    c.ports.join(", ")
+                };
+                let ports_cell = Cell::from(truncate(&ports_str, 28));
+                Row::new(vec![name_cell, image_cell, status_cell, cpu_cell, mem_cell, ports_cell])
+            } else {
+                Row::new(vec![name_cell, image_cell, status_cell, cpu_cell, mem_cell])
+            }
+        }).collect();
+        (rows, vis)
+    };
 
     let mut state = TableState::default();
     state.select(Some(visual_selected));
@@ -330,7 +411,7 @@ fn draw_inspect(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(paragraph, area);
 }
 
-fn draw_logs(f: &mut Frame, area: Rect, app: &App) {
+fn draw_logs(f: &mut Frame, area: Rect, app: &mut App) {
     let follow_indicator = if app.log_follow { " [follow]" } else { "" };
     let filter_label = if app.log_filter != LogFilter::NoFilter {
         format!(" [filter: {}]", app.log_filter.label())
@@ -354,6 +435,7 @@ fn draw_logs(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let visible_height = log_area.height.saturating_sub(2) as usize;
+    app.log_view_height = visible_height;
 
     // Filter lines according to log_filter
     let filtered_lines: Vec<(usize, &String)> = app.log_lines
@@ -473,7 +555,8 @@ fn draw_images(f: &mut Frame, area: Rect, app: &mut App) {
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "<none>".to_string());
-            let id = &img.id[7..15.min(img.id.len())]; // strip "sha256:" prefix, show 8 chars
+            let id_str = img.id.strip_prefix("sha256:").unwrap_or(&img.id);
+            let id = &id_str[..8.min(id_str.len())]; // show first 8 chars of digest
             let size = format_bytes(img.size);
             let age = format_age(img.created);
             Row::new(vec![
@@ -548,18 +631,97 @@ fn draw_contexts(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
+fn draw_volumes(f: &mut Frame, area: Rect, app: &mut App) {
+    let filter_text = app.volume_filter_input.clone();
+    let filter_active = app.volume_filter_active;
+
+    let (table_area, filter_bar_area) = if filter_text.is_some() || filter_active {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (area, None)
+    };
+
+    let header = Row::new(vec![
+        Cell::from("Name")
+            .style(Style::default().fg(HEADER_COLOR).add_modifier(Modifier::BOLD)),
+        Cell::from("Driver")
+            .style(Style::default().fg(HEADER_COLOR).add_modifier(Modifier::BOLD)),
+        Cell::from("Mountpoint")
+            .style(Style::default().fg(HEADER_COLOR).add_modifier(Modifier::BOLD)),
+        Cell::from("Created")
+            .style(Style::default().fg(HEADER_COLOR).add_modifier(Modifier::BOLD)),
+    ]);
+
+    let filtered_volumes = app.filtered_volumes();
+    let visual_selected = app.volume_selected.min(filtered_volumes.len().saturating_sub(1));
+
+    let rows: Vec<Row> = filtered_volumes
+        .iter()
+        .map(|v| {
+            Row::new(vec![
+                Cell::from(v.name.clone()),
+                Cell::from(v.driver.clone()),
+                Cell::from(truncate(&v.mountpoint, 40)),
+                Cell::from(v.created_at.clone()),
+            ])
+        })
+        .collect();
+
+    let mut state = TableState::default();
+    if !filtered_volumes.is_empty() {
+        state.select(Some(visual_selected));
+    }
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(25),
+            Constraint::Percentage(10),
+            Constraint::Percentage(45),
+            Constraint::Percentage(20),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Volumes ")
+            .title_alignment(Alignment::Left),
+    )
+    .row_highlight_style(
+        Style::default()
+            .fg(SELECTED_COLOR)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    f.render_stateful_widget(table, table_area, &mut state);
+
+    if let Some(bar_area) = filter_bar_area {
+        let input = filter_text.as_deref().unwrap_or("");
+        let cursor = if filter_active { "_" } else { "" };
+        let bar = Paragraph::new(format!("Filter: {input}{cursor}"))
+            .style(Style::default().fg(Color::White).bg(Color::DarkGray));
+        f.render_widget(bar, bar_area);
+    }
+}
+
 fn draw_status_bar(f: &mut Frame, area: Rect, app: &App) {
     let hints = match app.view {
         View::Containers => {
             if app.inspect_view {
                 "j/k:scroll  esc:back  q:quit"
             } else {
-                "j/k:nav  enter:logs  e:exec  E:custom-exec  s:start/stop  r:restart  d:remove  P:pause  i:inspect  S:sort  W:wide  /:filter  space:select  y:copy  q:quit"
+                "j/k:nav  enter:logs  e:exec  E:custom-exec  s:start/stop  r:restart  d:remove  P:pause  i:inspect  S:sort  W:wide  C:group  /:filter  space:select  y:copy  q:quit"
             }
         }
         View::Logs => "j/k:scroll  f:follow  g:top  G:bottom  /:search  n/N:next/prev  E:export  F:filter  esc:back  q:quit",
-        View::Images => "j/k:navigate  /:filter  y:copy  tab:switch  q:quit",
+        View::Images => "j/k:navigate  d:delete  /:filter  y:copy  tab:switch  q:quit",
         View::Contexts => "j/k:navigate  enter:switch context  tab:switch  q:quit",
+        View::Volumes => "j/k:navigate  /:filter  tab:switch  q:quit",
     };
 
     let sel_count = app.container_selected_ids.len();
@@ -634,13 +796,19 @@ fn parse_ansi_spans(s: &str, highlight_query: Option<&str>, is_current_match: bo
         for (text, style) in segments {
             let lower_text = text.to_lowercase();
             let mut pos = 0;
-            for m in lower_text.match_indices(&lower_query as &str) {
-                let (start, _) = m;
+            for (start, matched) in lower_text.match_indices(&lower_query as &str) {
+                let end = start + matched.len();
+                // Verify the byte offsets are valid boundaries in the original text before slicing.
+                if start > text.len() || end > text.len()
+                    || !text.is_char_boundary(start) || !text.is_char_boundary(end)
+                {
+                    continue;
+                }
                 if pos < start {
                     result.push(Span::styled(text[pos..start].to_string(), style));
                 }
-                result.push(Span::styled(text[start..start + query.len()].to_string(), highlight_style));
-                pos = start + query.len();
+                result.push(Span::styled(text[start..end].to_string(), highlight_style));
+                pos = end;
             }
             if pos < text.len() {
                 result.push(Span::styled(text[pos..].to_string(), style));
@@ -688,9 +856,10 @@ fn parse_ansi_segments(s: &str) -> Vec<(String, Style)> {
                 if i < len { i += 1; }
             }
         } else {
-            // Regular character
-            current_text.push(bytes[i] as char);
-            i += 1;
+            // Regular character — decode the full UTF-8 char at this byte position.
+            let ch = s[i..].chars().next().unwrap_or('\u{FFFD}');
+            current_text.push(ch);
+            i += ch.len_utf8();
         }
     }
 
