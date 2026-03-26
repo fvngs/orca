@@ -25,6 +25,7 @@ pub struct ContainerInfo {
     pub cpu_percent: f64,
     pub mem_usage: u64,
     pub mem_limit: u64,
+    pub ports: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +141,30 @@ impl DockerBackend {
             .remove_container(id, Some(opts))
             .await
             .context("remove container")
+    }
+
+    pub async fn pause(&self, id: &str) -> Result<()> {
+        self.client
+            .pause_container(id)
+            .await
+            .context("pause container")
+    }
+
+    pub async fn unpause(&self, id: &str) -> Result<()> {
+        self.client
+            .unpause_container(id)
+            .await
+            .context("unpause container")
+    }
+
+    pub async fn inspect_container_json(&self, id: &str) -> Result<Vec<String>> {
+        let info = self
+            .client
+            .inspect_container(id, None::<InspectContainerOptions>)
+            .await
+            .context("inspect container")?;
+        let json = serde_json::to_string_pretty(&info).context("serialize inspect")?;
+        Ok(json.lines().map(|l| l.to_string()).collect())
     }
 
     pub async fn stream_logs(&self, id: &str, tx: mpsc::Sender<String>) -> Result<()> {
@@ -265,6 +290,28 @@ fn container_info_from_summary(s: ContainerSummary) -> ContainerInfo {
         .as_ref()
         .and_then(|l| l.get("com.docker.compose.project").cloned());
 
+    // Collect port bindings
+    let ports: Vec<String> = s
+        .ports
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| {
+            use bollard::models::PortTypeEnum;
+            let private = p.private_port;
+            let proto_str = match p.typ.as_ref() {
+                Some(PortTypeEnum::TCP) | None => "tcp",
+                Some(PortTypeEnum::UDP) => "udp",
+                Some(PortTypeEnum::SCTP) => "sctp",
+                _ => "tcp",
+            };
+            if let (Some(ip), Some(public)) = (p.ip.as_deref(), p.public_port) {
+                format!("{ip}:{public}->{private}/{proto_str}")
+            } else {
+                format!("{private}/{proto_str}")
+            }
+        })
+        .collect();
+
     ContainerInfo {
         id,
         name,
@@ -275,6 +322,7 @@ fn container_info_from_summary(s: ContainerSummary) -> ContainerInfo {
         cpu_percent: 0.0,
         mem_usage: 0,
         mem_limit: 0,
+        ports,
     }
 }
 

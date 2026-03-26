@@ -61,13 +61,13 @@ async fn run(
 
         match events::handle_events(&mut app).await? {
             EventOutcome::Quit => break,
-            EventOutcome::ExecShell { container_id } => {
+            EventOutcome::ExecShell { container_id, shell } => {
                 // Suspend TUI, hand terminal to exec, then resume
                 disable_raw_mode()?;
                 execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
                 let kind = app.backend.kind.clone();
-                let _ = exec_shell_blocking(&container_id, &kind);
+                let _ = exec_shell_blocking(&container_id, &kind, &shell);
 
                 enable_raw_mode()?;
                 execute!(terminal.backend_mut(), EnterAlternateScreen)?;
